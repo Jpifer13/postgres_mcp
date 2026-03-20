@@ -50,6 +50,249 @@ Or pre-configure connections via environment variables:
 
 ---
 
+## Claude Code Examples
+
+These examples show what it looks like to use the postgres MCP server in a natural conversation with Claude Code.
+
+---
+
+### "Show me all appointments for John Smith"
+
+**You:**
+> Connect to my clinic database at localhost and show me all upcoming appointments for the client named John Smith
+
+**Claude Code:**
+
+First I'll connect to your database and explore the schema to find the relevant tables.
+
+```
+Tool: connect
+  alias: "clinic"
+  dsn:   "postgresql://user:pass@localhost:5432/clinic"
+  mode:  "readonly"
+```
+```
+Connected: clinic → clinic@localhost:5432 [readonly]
+```
+
+```
+Tool: list_tables
+  connection: "clinic"
+  schema:     "public"
+```
+```json
+[
+  { "table": "clients",      "type": "table", "rows_estimate": 2340,  "total_size": "1 MB"  },
+  { "table": "appointments", "type": "table", "rows_estimate": 18420, "total_size": "4 MB"  },
+  { "table": "providers",    "type": "table", "rows_estimate": 45,    "total_size": "32 kB" },
+  { "table": "services",     "type": "table", "rows_estimate": 120,   "total_size": "48 kB" }
+]
+```
+
+```
+Tool: describe_table
+  connection: "clinic"
+  table:      "appointments"
+```
+
+Now I can see the schema. Let me query for John Smith's upcoming appointments.
+
+```
+Tool: query
+  connection: "clinic"
+  sql:        "SELECT a.id, a.scheduled_at, a.duration_min, p.name AS provider,
+                      s.name AS service, a.status
+               FROM appointments a
+               JOIN clients c ON c.id = a.client_id
+               JOIN providers p ON p.id = a.provider_id
+               JOIN services s ON s.id = a.service_id
+               WHERE c.first_name = 'John' AND c.last_name = 'Smith'
+                 AND a.scheduled_at >= now()
+               ORDER BY a.scheduled_at"
+```
+```json
+[
+  { "id": 8012, "scheduled_at": "2026-03-23T10:00:00Z", "duration_min": 60, "provider": "Dr. Rivera",  "service": "Follow-up",      "status": "confirmed" },
+  { "id": 8241, "scheduled_at": "2026-04-07T14:30:00Z", "duration_min": 30, "provider": "Dr. Chen",    "service": "Lab Review",      "status": "pending"   },
+  { "id": 8509, "scheduled_at": "2026-04-21T09:00:00Z", "duration_min": 90, "provider": "Dr. Rivera",  "service": "Annual Physical", "status": "confirmed" }
+]
+```
+
+John Smith has 3 upcoming appointments:
+
+1. **Mar 23 at 10:00 AM** — 60-min Follow-up with Dr. Rivera (confirmed)
+2. **Apr 7 at 2:30 PM** — 30-min Lab Review with Dr. Chen (pending)
+3. **Apr 21 at 9:00 AM** — 90-min Annual Physical with Dr. Rivera (confirmed)
+
+---
+
+### "Which tables have the most bloat?"
+
+**You:**
+> Check the prod database for tables that need vacuuming
+
+**Claude Code:**
+
+```
+Tool: get_table_stats
+  connection: "prod"
+```
+```json
+[
+  { "table": "order_items", "live_rows": 1843201, "dead_rows": 312400, "last_autovacuum": "2026-03-14T02:15:00Z" },
+  { "table": "events",      "live_rows": 920100,  "dead_rows": 184300, "last_autovacuum": "2026-03-12T06:40:00Z" },
+  { "table": "sessions",    "live_rows": 54000,   "dead_rows": 1200,   "last_autovacuum": "2026-03-19T11:00:00Z" },
+  { "table": "users",       "live_rows": 84201,   "dead_rows": 320,    "last_autovacuum": "2026-03-19T14:30:00Z" }
+]
+```
+
+Two tables stand out with high dead-row ratios:
+
+- **order_items** — 312k dead rows (17% of live), last vacuumed 6 days ago
+- **events** — 184k dead rows (20% of live), last vacuumed 8 days ago
+
+Both would benefit from a manual `VACUUM ANALYZE`. The other tables look healthy.
+
+---
+
+### "Help me understand why this query is slow"
+
+**You:**
+> This query takes forever: `SELECT * FROM orders WHERE customer_email = 'jane@example.com'`
+
+**Claude Code:**
+
+Let me check the execution plan and look for missing indexes.
+
+```
+Tool: explain_query
+  connection: "prod"
+  sql:        "SELECT * FROM orders WHERE customer_email = 'jane@example.com'"
+  analyze:    true
+```
+```
+Seq Scan on orders  (cost=0.00..18204.43 rows=12 width=64)
+                    (actual time=892.10..1204.55 rows=9 loops=1)
+  Filter: (customer_email = 'jane@example.com'::text)
+  Rows Removed by Filter: 512034
+Planning Time: 0.3 ms
+Execution Time: 1204.6 ms
+```
+
+The problem is clear — PostgreSQL is doing a **sequential scan** across all 512k rows because there's no index on `customer_email`. It's checking every single row and filtering out all but 9.
+
+```
+Tool: list_indexes
+  connection: "prod"
+  table:      "orders"
+```
+```json
+[
+  { "name": "orders_pkey",           "columns": ["id"],         "unique": true  },
+  { "name": "orders_user_id_idx",    "columns": ["user_id"],    "unique": false },
+  { "name": "orders_created_at_idx", "columns": ["created_at"], "unique": false }
+]
+```
+
+Confirmed — no index on `customer_email`. Adding one should bring this query from ~1.2s down to under 1ms:
+
+```sql
+CREATE INDEX CONCURRENTLY orders_customer_email_idx ON orders (customer_email);
+```
+
+---
+
+### "Move a client's appointments to a different provider"
+
+**You:**
+> Reassign all of John Smith's upcoming appointments from Dr. Rivera to Dr. Patel
+
+**Claude Code:**
+
+Let me first verify the IDs we'll need, then make the update.
+
+```
+Tool: query
+  connection: "clinic"
+  sql:        "SELECT a.id, a.scheduled_at, s.name AS service
+               FROM appointments a
+               JOIN clients c ON c.id = a.client_id
+               JOIN providers p ON p.id = a.provider_id
+               WHERE c.first_name = 'John' AND c.last_name = 'Smith'
+                 AND p.name = 'Dr. Rivera'
+                 AND a.scheduled_at >= now()"
+```
+```json
+[
+  { "id": 8012, "scheduled_at": "2026-03-23T10:00:00Z", "service": "Follow-up"      },
+  { "id": 8509, "scheduled_at": "2026-04-21T09:00:00Z", "service": "Annual Physical" }
+]
+```
+
+That's 2 appointments to reassign. I'll need a readwrite connection for this.
+
+```
+Tool: connect
+  alias: "clinic-rw"
+  dsn:   "postgresql://admin:pass@localhost:5432/clinic"
+  mode:  "readwrite"
+```
+
+```
+Tool: execute
+  connection: "clinic-rw"
+  sql:        "UPDATE appointments
+               SET provider_id = (SELECT id FROM providers WHERE name = 'Dr. Patel')
+               WHERE id = ANY($1)"
+  params:     [[8012, 8509]]
+```
+```
+UPDATE 2
+```
+
+Done — both appointments have been reassigned to Dr. Patel:
+
+1. **Mar 23** — Follow-up (was Dr. Rivera, now Dr. Patel)
+2. **Apr 21** — Annual Physical (was Dr. Rivera, now Dr. Patel)
+
+---
+
+### "What's going on with the database right now?"
+
+**You:**
+> The app feels sluggish, can you check what's happening on prod?
+
+**Claude Code:**
+
+```
+Tool: get_active_queries
+  connection: "prod"
+```
+```json
+[
+  { "pid": 29105, "state": "active",  "duration": "00:00:12.44", "query": "SELECT o.*, oi.* FROM orders o JOIN order_items oi ON oi.order_id = o.id WHERE o.created_at > '2025-01-01'", "wait_event": null },
+  { "pid": 29200, "state": "idle in transaction", "duration": "00:04:22.01", "query": "BEGIN", "wait_event": "ClientRead" }
+]
+```
+
+```
+Tool: get_locks
+  connection: "prod"
+```
+```json
+[
+  { "pid": 29200, "relation": "orders", "lock_type": "RowExclusiveLock", "granted": true,  "blocked_by": null  },
+  { "pid": 29105, "relation": "orders", "lock_type": "AccessShareLock",  "granted": true,  "blocked_by": null  }
+]
+```
+
+Two issues:
+
+1. **PID 29105** — A heavy join across `orders` and `order_items` scanning everything since Jan 2025 has been running for 12 seconds. This is likely the source of the sluggishness.
+2. **PID 29200** — An idle transaction has been holding a `RowExclusiveLock` on `orders` for over 4 minutes. The client isn't sending anything (`ClientRead` wait). This looks like an abandoned transaction from the app that should be investigated.
+
+---
+
 ## Visual Examples
 
 ### Connecting to a database
